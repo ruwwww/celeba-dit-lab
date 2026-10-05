@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -42,7 +42,6 @@ def optimal_transport_path(
 def flow_matching_loss(
     model: nn.Module,
     x1: torch.Tensor,
-    *,
     t: torch.Tensor | None = None,
     x0: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -141,7 +140,6 @@ class FlowMatching(nn.Module):
     def loss(
         self,
         x1: torch.Tensor,
-        *,
         t: torch.Tensor | None = None,
         x0: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -150,17 +148,30 @@ class FlowMatching(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        num_samples: int,
+        num_samples: int | Sequence[int] | None = None,
         *,
+        shape: Sequence[int] | None = None,
         steps: int = 50,
+        num_steps: int | None = None,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        if num_samples <= 0:
-            raise ValueError("num_samples must be positive")
+        if num_steps is not None:
+            steps = num_steps
+        if shape is None:
+            if num_samples is None:
+                raise ValueError("provide num_samples or shape")
+            if isinstance(num_samples, int):
+                if num_samples <= 0:
+                    raise ValueError("num_samples must be positive")
+                shape = (num_samples, *self.latent_shape)
+            else:
+                shape = tuple(int(dimension) for dimension in num_samples)
+        if len(shape) != 4 or any(int(dimension) <= 0 for dimension in shape):
+            raise ValueError("shape must be a positive (N, C, H, W) tuple")
         return euler_sample(
             self.model,
-            (num_samples, *self.latent_shape),
+            shape,
             steps=steps,
             device=device,
             dtype=dtype,
@@ -170,6 +181,8 @@ class FlowMatching(nn.Module):
 # Friendly aliases for callers that name the objective after its formulation.
 OTFlowMatching = FlowMatching
 euler_ode_sampler = euler_sample
+euler_ode_sample = euler_sample
+euler_sampler = euler_sample
 
 
 __all__ = [
@@ -177,6 +190,8 @@ __all__ = [
     "OTFlowMatching",
     "euler_sample",
     "euler_ode_sampler",
+    "euler_ode_sample",
     "flow_matching_loss",
+    "euler_sampler",
     "optimal_transport_path",
 ]

@@ -4,8 +4,10 @@ from .dit import DiT, DiTBlock, FinalLayer, timestep_embedding
 from .flow import (
     FlowMatching,
     OTFlowMatching,
+    euler_ode_sample,
     euler_ode_sampler,
     euler_sample,
+    euler_sampler,
     flow_matching_loss,
     optimal_transport_path,
 )
@@ -16,8 +18,10 @@ __all__ = [
     "FinalLayer",
     "FlowMatching",
     "OTFlowMatching",
+    "euler_ode_sample",
     "euler_ode_sampler",
     "euler_sample",
+    "euler_sampler",
     "flow_matching_loss",
     "optimal_transport_path",
     "timestep_embedding",
