@@ -1,0 +1,6 @@
+- [ ] Implement `models/dit.py` (DiT with adaLN-Zero, patch=1 on 16x16 latent, hidden_size=512, 12 layers, 8 heads)
+- [ ] Implement `models/flow.py` (Optimal Transport Flow Matching loss & Euler ODE sampler)
+- [ ] Implement `models/__init__.py`
+- [ ] Implement `train.py` (AdamW, AMP bf16, EMA, periodic sample generation & checkpointing)
+- [ ] Implement `sample.py` (standalone CLI generator to output PNG grids)
+- [ ] Implement `tests/test_flow_dit.py` (validate shapes, loss backward, ODE step)
