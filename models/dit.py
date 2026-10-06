@@ -149,6 +149,38 @@ class FinalLayer(nn.Module):
         return self.linear(_modulate(self.norm_final(x), shift, scale))
 
 
+class LabelEmbedder(nn.Module):
+    """Embeds class labels into vector representations with CFG dropout."""
+
+    def __init__(self, num_classes: int, hidden_size: int, dropout_prob: float = 0.15) -> None:
+        super().__init__()
+        use_cfg_embedding = dropout_prob > 0
+        self.embedding_table = nn.Embedding(
+            num_classes + (1 if use_cfg_embedding else 0), hidden_size
+        )
+        self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
+
+    def token_drop(self, labels: torch.Tensor, force_drop_ids: torch.Tensor | None = None) -> torch.Tensor:
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        labels = torch.where(drop_ids, torch.tensor(self.num_classes, device=labels.device), labels)
+        return labels
+
+    def forward(
+        self,
+        labels: torch.Tensor,
+        train: bool,
+        force_drop_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        return self.embedding_table(labels)
+
+
 class DiT(nn.Module):
     """Diffusion Transformer predicting velocity fields over VAE latents."""
 
@@ -162,6 +194,8 @@ class DiT(nn.Module):
         depth: int = 12,
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
+        num_classes: int = 0,
+        class_dropout_prob: float = 0.15,
     ) -> None:
         super().__init__()
         input_height, input_width = _as_pair(input_size)
@@ -181,6 +215,7 @@ class DiT(nn.Module):
         self.hidden_size = hidden_size
         self.depth = depth
         self.num_heads = num_heads
+        self.num_classes = num_classes
         self.num_patches = (input_height // patch_size) * (input_width // patch_size)
 
         self.x_embedder = nn.Conv2d(
@@ -200,6 +235,10 @@ class DiT(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
+        if num_classes > 0:
+            self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        else:
+            self.y_embedder = None
         self.blocks = nn.ModuleList(
             DiTBlock(hidden_size, num_heads, mlp_ratio) for _ in range(depth)
         )
@@ -214,6 +253,8 @@ class DiT(nn.Module):
         nn.init.zeros_(self.t_embedder[0].bias)
         nn.init.normal_(self.t_embedder[2].weight, std=0.02)
         nn.init.zeros_(self.t_embedder[2].bias)
+        if self.y_embedder is not None:
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
         zero_initialized = {
             block.adaLN_modulation[-1] for block in self.blocks
         }
@@ -241,7 +282,12 @@ class DiT(nn.Module):
         )
         return position_embedding.to(device=x.device, dtype=x.dtype).unsqueeze(0)
 
-    def forward(self, x: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        y: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if x.ndim != 4 or x.shape[1] != self.in_channels:
             raise ValueError(
                 f"expected latent input (N, {self.in_channels}, H, W), got {tuple(x.shape)}"
@@ -261,10 +307,15 @@ class DiT(nn.Module):
         patch_height, patch_width = height // self.patch_size, width // self.patch_size
         tokens = self.x_embedder(x).flatten(2).transpose(1, 2)
         tokens = tokens + self._position_embedding(height, width, x)
-        timestep_value = self.t_embedder(timestep_embedding(timesteps, self.hidden_size).to(x.dtype))
+        conditioning = self.t_embedder(timestep_embedding(timesteps, self.hidden_size).to(x.dtype))
+        if self.y_embedder is not None:
+            if y is None:
+                y = torch.full((x.shape[0],), self.num_classes, device=x.device, dtype=torch.long)
+            conditioning = conditioning + self.y_embedder(y, train=self.training)
+
         for block in self.blocks:
-            tokens = block(tokens, timestep_value)
-        patches = self.final_layer(tokens, timestep_value)
+            tokens = block(tokens, conditioning)
+        patches = self.final_layer(tokens, conditioning)
         patches = patches.reshape(
             x.shape[0],
             patch_height,

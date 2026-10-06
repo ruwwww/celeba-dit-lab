@@ -64,3 +64,31 @@ def test_five_step_euler_sampling_returns_latent_batch():
 
     assert samples.shape == (3, 32, 16, 16)
     assert torch.isfinite(samples).all()
+
+
+def test_dit_with_cfg_and_labels():
+    model = DiT(
+        input_size=16,
+        patch_size=1,
+        in_channels=32,
+        hidden_size=64,
+        depth=2,
+        num_heads=4,
+        num_classes=64,
+        class_dropout_prob=0.15,
+    )
+    latents = torch.randn(2, 32, 16, 16)
+    timesteps = torch.tensor([0.2, 0.8])
+    labels = torch.tensor([5, 12])
+
+    pred = model(latents, timesteps, y=labels)
+    assert pred.shape == latents.shape
+
+    samples = euler_sample(
+        model,
+        shape=(2, 32, 16, 16),
+        y=labels,
+        cfg_scale=2.5,
+        steps=5,
+    )
+    assert samples.shape == (2, 32, 16, 16)

@@ -1,4 +1,4 @@
-"""Generate a grid of CelebA-HQ faces from a trained latent DiT."""
+"""Generate a grid of CelebA-HQ faces from a trained latent DiT with CFG."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="samples.png")
     parser.add_argument("--num-samples", type=int, default=16)
     parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--cfg-scale", type=float, default=3.0)
+    parser.add_argument("--class-id", type=int, default=None, help="Specific class ID to condition on (0..63)")
     parser.add_argument("--nrow", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda")
@@ -51,6 +53,7 @@ def load_flow_model(checkpoint_path: str | Path, device: torch.device) -> tuple[
             "hidden_size": 512,
             "depth": 12,
             "num_heads": 8,
+            "num_classes": 0,
         }
     model = DiT(**config).to(device)
     state_dict = checkpoint.get("ema", checkpoint.get("model"))
@@ -73,19 +76,29 @@ def sample(args: argparse.Namespace) -> None:
 
     model, latent_size = load_flow_model(args.checkpoint, device)
     vae = load_frozen_vae(args.vae_checkpoint, device=device)
+
+    labels = None
+    if getattr(model, "num_classes", 0) > 0:
+        if args.class_id is not None:
+            labels = torch.full((args.num_samples,), args.class_id, device=device, dtype=torch.long)
+        else:
+            labels = torch.arange(args.num_samples, device=device) % model.num_classes
+
     images = generate_images(
         model,
         vae,
         num_images=args.num_samples,
         latent_size=latent_size,
         steps=args.steps,
+        cfg_scale=args.cfg_scale,
+        labels=labels,
         device=device,
     )
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     nrow = args.nrow if args.nrow is not None else max(1, int(args.num_samples**0.5))
     save_image(_denormalize(images).cpu(), output_path, nrow=nrow)
-    print(f"saved {args.num_samples} samples to {output_path}")
+    print(f"saved {args.num_samples} samples with cfg_scale={args.cfg_scale} to {output_path}")
 
 
 def main(argv: list[str] | None = None) -> None:

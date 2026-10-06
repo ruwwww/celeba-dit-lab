@@ -1,4 +1,4 @@
-"""Train a latent DiT with optimal-transport flow matching."""
+"""Train a latent DiT with optimal-transport flow matching and classifier-free guidance."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
 
-from data.dataset import CelebAHQImageDataset
+from data.dataset import CelebAHQImageDataset, CachedLatentDataset
 from models import DiT, FlowMatching, euler_sample
 from vae_loader import load_frozen_vae
 
@@ -23,19 +23,26 @@ from vae_loader import load_frozen_vae
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", default="/mnt/data/celeba_hq/data")
+    parser.add_argument("--cached-latents", default="/mnt/data/Coding3/celeba-dit-lab/cached_data/celeba_train_latents_clustered.pt")
     parser.add_argument("--vae-checkpoint", default="/mnt/data/Coding3/celeba-vae-lab/outputs/adaptive_stage/checkpoint_0035.pt")
-    parser.add_argument("--output-dir", default="outputs")
+    parser.add_argument("--output-dir", default="outputs/flow_dit_cfg")
     parser.add_argument("--image-size", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--hidden-size", type=int, default=512)
+    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--ema-decay", type=float, default=0.999)
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--num-classes", type=int, default=64)
+    parser.add_argument("--class-dropout", type=float, default=0.15)
+    parser.add_argument("--cfg-scale", type=float, default=3.0)
+    parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--sample-every", type=int, default=1_000)
-    parser.add_argument("--checkpoint-every", type=int, default=1_000)
+    parser.add_argument("--checkpoint-every", type=int, default=5)
     parser.add_argument("--sample-steps", type=int, default=50)
     parser.add_argument("--sample-count", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
@@ -97,15 +104,24 @@ def _denormalize(images: torch.Tensor) -> torch.Tensor:
     return images.add(1).div(2).clamp(0, 1)
 
 
-def _model_config(latent_size: int) -> dict[str, int]:
+def _model_config(
+    latent_size: int,
+    hidden_size: int = 512,
+    depth: int = 12,
+    num_heads: int = 8,
+    num_classes: int = 0,
+    class_dropout: float = 0.15,
+) -> dict[str, int | float]:
     return {
         "input_size": latent_size,
         "patch_size": 1,
         "in_channels": 32,
         "out_channels": 32,
-        "hidden_size": 512,
-        "depth": 12,
-        "num_heads": 8,
+        "hidden_size": hidden_size,
+        "depth": depth,
+        "num_heads": num_heads,
+        "num_classes": num_classes,
+        "class_dropout_prob": class_dropout,
     }
 
 
@@ -117,11 +133,18 @@ def generate_images(
     num_images: int,
     latent_size: int,
     steps: int,
+    cfg_scale: float = 1.0,
+    labels: torch.Tensor | None = None,
     device: torch.device,
 ) -> torch.Tensor:
+    num_classes = getattr(model, "num_classes", 0)
+    if labels is None and num_classes > 0:
+        labels = torch.randint(0, num_classes, (num_images,), device=device)
     latents = euler_sample(
         model,
         (num_images, 32, latent_size, latent_size),
+        y=labels,
+        cfg_scale=cfg_scale,
         steps=steps,
         device=device,
         dtype=torch.float32,
@@ -138,6 +161,8 @@ def save_sample_grid(
     num_images: int,
     latent_size: int,
     steps: int,
+    cfg_scale: float = 3.0,
+    labels: torch.Tensor | None = None,
     device: torch.device,
 ) -> None:
     was_training = model.training
@@ -149,6 +174,8 @@ def save_sample_grid(
         num_images=num_images,
         latent_size=latent_size,
         steps=steps,
+        cfg_scale=cfg_scale,
+        labels=labels,
         device=device,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +191,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     epoch: int,
     step: int,
-    model_config: dict[str, int],
+    model_config: dict[str, int | float],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -196,7 +223,14 @@ def train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     latent_size = args.image_size // 16
-    model_config = _model_config(latent_size)
+    model_config = _model_config(
+        latent_size,
+        hidden_size=args.hidden_size,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        num_classes=args.num_classes,
+        class_dropout=args.class_dropout,
+    )
     model = DiT(**model_config).to(device)
     ema = ModelEMA(model, args.ema_decay)
     flow = FlowMatching(model, latent_shape=(32, latent_size, latent_size))
@@ -210,11 +244,6 @@ def train(args: argparse.Namespace) -> None:
     global_step = 0
     if args.resume:
         checkpoint = _load_checkpoint(args.resume, device)
-        saved_config = checkpoint.get("model_config")
-        if saved_config is not None and saved_config != model_config:
-            raise ValueError(
-                f"checkpoint model_config {saved_config} does not match requested {model_config}"
-            )
         model.load_state_dict(checkpoint["model"])
         ema.load_state_dict(checkpoint["ema"])
         if "optimizer" in checkpoint:
@@ -222,11 +251,18 @@ def train(args: argparse.Namespace) -> None:
         start_epoch = int(checkpoint.get("epoch", -1)) + 1
         global_step = int(checkpoint.get("step", 0))
 
-    dataset = CelebAHQImageDataset(
-        data_dir=args.data_dir,
-        image_size=args.image_size,
-        split="train",
-    )
+    use_cache = args.cached_latents and Path(args.cached_latents).exists()
+    if use_cache:
+        print(f"Using cached latents dataset from {args.cached_latents}")
+        dataset = CachedLatentDataset(args.cached_latents)
+    else:
+        print("Cached latents not found. Falling back to on-the-fly VAE encoding.")
+        dataset = CelebAHQImageDataset(
+            data_dir=args.data_dir,
+            image_size=args.image_size,
+            split="train",
+        )
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -238,16 +274,27 @@ def train(args: argparse.Namespace) -> None:
     vae = load_frozen_vae(args.vae_checkpoint, device=device)
     amp_enabled = bool(args.amp and device.type in {"cuda", "cpu"})
 
+    # Fixed sample labels for consistent visualization over epochs
+    fixed_labels = None
+    if args.num_classes > 0:
+        fixed_labels = torch.arange(args.sample_count, device=device) % args.num_classes
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        for images in loader:
-            images = images.to(device, non_blocking=True)
-            with torch.no_grad():
-                clean_latents = vae.encode(images).float()
+        for batch_data in loader:
+            if use_cache:
+                clean_latents, labels = batch_data
+                clean_latents = clean_latents.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+            else:
+                images = batch_data.to(device, non_blocking=True)
+                with torch.no_grad():
+                    clean_latents = vae.encode(images).float()
+                labels = None
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, amp_enabled):
-                loss = flow.loss(clean_latents)
+                loss = flow.loss(clean_latents, y=labels)
             loss.backward()
             optimizer.step()
             ema.update(model)
@@ -266,20 +313,20 @@ def train(args: argparse.Namespace) -> None:
                     num_images=args.sample_count,
                     latent_size=latent_size,
                     steps=args.sample_steps,
+                    cfg_scale=args.cfg_scale,
+                    labels=fixed_labels,
                     device=device,
                 )
-            if global_step % args.checkpoint_every == 0:
-                save_checkpoint(
-                    output_dir / f"checkpoint_{global_step:08d}.pt",
-                    model=model,
-                    ema=ema,
-                    optimizer=optimizer,
-                    epoch=epoch,
-                    step=global_step,
-                    model_config=model_config,
-                )
-            if args.max_steps is not None and global_step >= args.max_steps:
-                break
+        if (epoch + 1) % args.checkpoint_every == 0 or (epoch + 1) == args.epochs:
+            save_checkpoint(
+                output_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt",
+                model=model,
+                ema=ema,
+                optimizer=optimizer,
+                epoch=epoch,
+                step=global_step,
+                model_config=model_config,
+            )
         if args.max_steps is not None and global_step >= args.max_steps:
             break
 

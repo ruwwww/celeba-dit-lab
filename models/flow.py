@@ -44,6 +44,7 @@ def flow_matching_loss(
     x1: torch.Tensor,
     t: torch.Tensor | None = None,
     x0: torch.Tensor | None = None,
+    y: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute the MSE velocity loss for an OT conditional flow path."""
     if x1.ndim < 2:
@@ -55,7 +56,11 @@ def flow_matching_loss(
     if t is None:
         t = torch.rand(x1.shape[0], device=x1.device)
     x_t, target_velocity = optimal_transport_path(x0, x1, t)
-    predicted_velocity = model(x_t, _batch_timesteps(t, x1.shape[0], x1.device))
+    batch_t = _batch_timesteps(t, x1.shape[0], x1.device)
+    if y is not None:
+        predicted_velocity = model(x_t, batch_t, y=y)
+    else:
+        predicted_velocity = model(x_t, batch_t)
     if predicted_velocity.shape != target_velocity.shape:
         raise ValueError(
             "flow model output must match the latent shape: "
@@ -86,11 +91,13 @@ def euler_sample(
     model: nn.Module,
     shape: Sequence[int],
     *,
+    y: torch.Tensor | None = None,
+    cfg_scale: float = 1.0,
     steps: int = 50,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Integrate ``dx/dt = model(x, t)`` from ``t=0`` to ``t=1``."""
+    """Integrate ``dx/dt = model(x, t)`` from ``t=0`` to ``t=1`` with optional CFG."""
     if steps <= 0:
         raise ValueError("steps must be positive")
     if len(shape) < 2 or any(int(dimension) <= 0 for dimension in shape):
@@ -106,10 +113,19 @@ def euler_sample(
     samples = torch.randn(tuple(int(dimension) for dimension in shape), device=sample_device, dtype=dtype)
     times = torch.linspace(0.0, 1.0, steps + 1, device=sample_device, dtype=torch.float32)
 
+    num_classes = getattr(model, "num_classes", 0)
+    use_cfg = cfg_scale > 1.0 and num_classes > 0 and y is not None
+
     with _evaluation_mode(model):
         for index in range(steps):
             timestep = times[index].expand(samples.shape[0])
-            velocity = model(samples, timestep)
+            if use_cfg:
+                null_y = torch.full_like(y, fill_value=num_classes)
+                v_cond = model(samples, timestep, y=y)
+                v_uncond = model(samples, timestep, y=null_y)
+                velocity = v_uncond + cfg_scale * (v_cond - v_uncond)
+            else:
+                velocity = model(samples, timestep, y=y) if num_classes > 0 else model(samples, timestep)
             if velocity.shape != samples.shape:
                 raise ValueError(
                     "flow model output must match the sample shape: "
@@ -134,16 +150,18 @@ class FlowMatching(nn.Module):
         x1: torch.Tensor,
         t: torch.Tensor | None = None,
         x0: torch.Tensor | None = None,
+        y: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.loss(x1, t=t, x0=x0)
+        return self.loss(x1, t=t, x0=x0, y=y)
 
     def loss(
         self,
         x1: torch.Tensor,
         t: torch.Tensor | None = None,
         x0: torch.Tensor | None = None,
+        y: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return flow_matching_loss(self.model, x1, t=t, x0=x0)
+        return flow_matching_loss(self.model, x1, t=t, x0=x0, y=y)
 
     @torch.no_grad()
     def sample(
@@ -151,6 +169,8 @@ class FlowMatching(nn.Module):
         num_samples: int | Sequence[int] | None = None,
         *,
         shape: Sequence[int] | None = None,
+        y: torch.Tensor | None = None,
+        cfg_scale: float = 1.0,
         steps: int = 50,
         num_steps: int | None = None,
         device: torch.device | str | None = None,
@@ -172,6 +192,8 @@ class FlowMatching(nn.Module):
         return euler_sample(
             self.model,
             shape,
+            y=y,
+            cfg_scale=cfg_scale,
             steps=steps,
             device=device,
             dtype=dtype,
